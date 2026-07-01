@@ -1629,13 +1629,26 @@ class PlacedAssetItem(QWidget):
             if len(pts) == 2:
                 if t == QEvent.Type.TouchBegin:
                     self._touch_count = 2
+                    self._two_finger_start = (pts[0].position(), pts[1].position())
                     self._lock_timer.start(self.LOCK_HOLD_MS)
+                elif t == QEvent.Type.TouchUpdate and self._lock_timer.isActive():
+                    # Cancel the lock hold once fingers move — it's a pinch, not a hold
+                    s1, s2 = getattr(self, '_two_finger_start', (pts[0].position(), pts[1].position()))
+                    moved = max((pts[0].position() - s1).manhattanLength(),
+                                (pts[1].position() - s2).manhattanLength())
+                    if moved > self.DRAG_THRESHOLD:
+                        self._lock_timer.stop()
                 elif t == QEvent.Type.TouchEnd:
                     self._lock_timer.stop()
                     self._touch_count = 0
+                # Forward to the canvas so pinch-to-zoom works over props too
+                self._canvas.event(event)
             elif self._touch_count == 2:
                 self._lock_timer.stop()
                 self._touch_count = len(pts)
+                if t == QEvent.Type.TouchEnd:
+                    self._canvas.event(event)
+                    self._touch_count = 0
             return True
         return super().event(event)
 
@@ -1658,6 +1671,17 @@ class MiniMapCanvas(QWidget):
         self._items: list[PlacedAssetItem] = []
         self._bg_pixmap: Optional[QPixmap] = None
         self._scene_size = QSizeF(16, 9)
+        # pinch-to-zoom / pan state (mirrors OutputWindow)
+        self._zoom: float = 1.0
+        self._pan_x: float = 0.0
+        self._pan_y: float = 0.0
+        self._pinch_start_dist: float = 0.0
+        self._pinch_start_zoom: float = 1.0
+        self._pinch_start_pan: tuple = (0.0, 0.0)
+        self._pinch_start_center: tuple = (0.0, 0.0)
+        self._pan_drag_start: Optional[QPoint] = None
+        self._pan_start: tuple = (0.0, 0.0)
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents)
         self.setAcceptDrops(True)
         self.setStyleSheet(f"background:{C_VOID};")
         self._refresh_background_from_output()
@@ -1686,11 +1710,115 @@ class MiniMapCanvas(QWidget):
         sw = max(1.0, self._scene_size.width())
         sh = max(1.0, self._scene_size.height())
         scale = min(self.width() / sw, self.height() / sh) if self.width() and self.height() else 1.0
+        scale *= self._zoom
         w = sw * scale
         h = sh * scale
-        x = (self.width() - w) / 2
-        y = (self.height() - h) / 2
+        x = (self.width() - w) / 2 + self._pan_x
+        y = (self.height() - h) / 2 + self._pan_y
         return x, y, w, h
+
+    # ── pinch-to-zoom / pan ──────────────────────────────────────────────────
+
+    def _apply_view(self):
+        for item in self._items:
+            self._position_item(item)
+        self.update()
+
+    def reset_zoom(self):
+        self._zoom  = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._apply_view()
+
+    def _clamp_pan(self):
+        """Keep pan within the zoomed scene bounds so you can't pan to empty void."""
+        if self._zoom <= 1.0:
+            self._pan_x = 0.0
+            self._pan_y = 0.0
+            return
+        max_pan_x = self.width()  * (self._zoom - 1) / 2
+        max_pan_y = self.height() * (self._zoom - 1) / 2
+        self._pan_x = max(-max_pan_x, min(max_pan_x, self._pan_x))
+        self._pan_y = max(-max_pan_y, min(max_pan_y, self._pan_y))
+
+    def _set_zoom_at(self, new_zoom: float, cx: float, cy: float):
+        """Zoom so the scene point under (cx, cy) stays fixed on screen."""
+        new_zoom = max(1.0, min(8.0, new_zoom))
+        if new_zoom == self._zoom:
+            return
+        ratio = new_zoom / self._zoom
+        # Vector from widget center to the anchor point scales with zoom;
+        # pan must absorb the difference so the anchor stays put.
+        wcx = self.width()  / 2
+        wcy = self.height() / 2
+        self._pan_x = (self._pan_x - (cx - wcx)) * ratio + (cx - wcx)
+        self._pan_y = (self._pan_y - (cy - wcy)) * ratio + (cy - wcy)
+        self._zoom  = new_zoom
+        self._clamp_pan()
+        self._apply_view()
+
+    def event(self, e):
+        t = e.type()
+        if t in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
+            pts = e.points()
+            if len(pts) == 2:
+                p1 = pts[0].position()
+                p2 = pts[1].position()
+                dist = ((p2.x() - p1.x()) ** 2 + (p2.y() - p1.y()) ** 2) ** 0.5
+                cx   = (p1.x() + p2.x()) / 2
+                cy   = (p1.y() + p2.y()) / 2
+                if t == QEvent.Type.TouchBegin or self._pinch_start_dist == 0:
+                    self._pinch_start_dist   = dist
+                    self._pinch_start_zoom   = self._zoom
+                    self._pinch_start_pan    = (self._pan_x, self._pan_y)
+                    self._pinch_start_center = (cx, cy)
+                elif t == QEvent.Type.TouchUpdate and self._pinch_start_dist > 0:
+                    ratio    = dist / self._pinch_start_dist
+                    new_zoom = max(1.0, min(8.0, self._pinch_start_zoom * ratio))
+                    # Pan so the pinch center stays fixed on screen
+                    dcx = cx - self._pinch_start_center[0]
+                    dcy = cy - self._pinch_start_center[1]
+                    self._zoom  = new_zoom
+                    self._pan_x = self._pinch_start_pan[0] * ratio + dcx
+                    self._pan_y = self._pinch_start_pan[1] * ratio + dcy
+                    self._clamp_pan()
+                    self._apply_view()
+            elif t == QEvent.Type.TouchEnd:
+                self._pinch_start_dist = 0
+                if self._zoom < 1.05:
+                    self.reset_zoom()
+            return True
+        return super().event(e)
+
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120
+        if steps:
+            pos = event.position()
+            self._set_zoom_at(self._zoom * (1.15 ** steps), pos.x(), pos.y())
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._zoom > 1.0:
+            self._pan_drag_start = event.pos()
+            self._pan_start      = (self._pan_x, self._pan_y)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_drag_start is not None:
+            d = event.pos() - self._pan_drag_start
+            self._pan_x = self._pan_start[0] + d.x()
+            self._pan_y = self._pan_start[1] + d.y()
+            self._clamp_pan()
+            self._apply_view()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._pan_drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.reset_zoom()
+        super().mouseDoubleClickEvent(event)
 
     def _sync_live_to_output(self):
         assets = self.get_placed_assets()
@@ -1743,6 +1871,7 @@ class MiniMapCanvas(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._clamp_pan()
         for item in self._items:
             self._position_item(item)
 
@@ -1833,7 +1962,8 @@ class MiniMapDialog(QDialog):
         hint = QLabel(
             "Drag asset → map to place   •   Tap = play sound   •   "
             "Double-tap = hide/show   •   Double-tap + hold = delete   •   "
-            "Two-finger 5 s = lock")
+            "Two-finger 5 s = lock   •   Pinch = zoom   •   "
+            "Drag map = pan   •   Double-tap map = reset zoom")
         hint.setStyleSheet(f"color:{C_TEXT_RUNE}; font-size:{pt(9)}pt;")
         tl.addWidget(hint)
         tl.addStretch(1)
@@ -2998,8 +3128,22 @@ class ControlWindow(QWidget):
         sub.setStyleSheet(
             f'font-family:"{FONT_SERIF}"; font-size:{pt(10)}pt; color:{C_TEXT_RUNE}; letter-spacing:1px;'
         )
-        root.addWidget(header)
-        root.addWidget(sub)
+        exit_btn = QPushButton("⏻  Exit")
+        exit_btn.setProperty("danger", True)
+        exit_btn.setMinimumHeight(px(72))
+        exit_btn.setMinimumWidth(px(140))
+        exit_btn.clicked.connect(self._confirm_exit)
+
+        head_row = QHBoxLayout()
+        head_row.setSpacing(px(12))
+        head_col = QVBoxLayout()
+        head_col.setSpacing(0)
+        head_col.addWidget(header)
+        head_col.addWidget(sub)
+        head_row.addLayout(head_col)
+        head_row.addStretch(1)
+        head_row.addWidget(exit_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(head_row)
 
         rule = QFrame()
         rule.setFrameShape(QFrame.Shape.HLine)
@@ -3623,6 +3767,22 @@ class ControlWindow(QWidget):
             self.blank_all()
         else:
             super().keyPressEvent(event)
+
+    def _confirm_exit(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("Exit SceneCaster")
+        box.setText("Close SceneCaster and all output screens?")
+        box.setIcon(QMessageBox.Icon.Question)
+        exit_b   = box.addButton("⏻  Exit", QMessageBox.ButtonRole.AcceptRole)
+        cancel_b = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        # Big tap targets for the touch panel
+        for b in (exit_b, cancel_b):
+            if b:
+                b.setMinimumSize(px(160), px(80))
+        box.setDefaultButton(cancel_b)
+        box.exec()
+        if box.clickedButton() is exit_b:
+            self.close()
 
     def closeEvent(self, event):
         for w in self.outputs:
