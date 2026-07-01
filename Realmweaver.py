@@ -36,7 +36,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QPixmap, QMovie, QGuiApplication, QFont,
     QImageReader, QDragEnterEvent, QDropEvent, QTransform, QPainter,
-    QColor, QPen, QPolygonF, QDrag
+    QColor, QPen, QPolygonF, QDrag, QIcon
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QColorDialog, QDoubleSpinBox, QGraphicsOpacityEffect, QSpinBox, QScroller
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
-from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
+from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem, QVideoWidget
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 GIF_EXT   = {".gif"}
@@ -58,9 +58,25 @@ ALL_EXT   = IMAGE_EXT | GIF_EXT | VIDEO_EXT
 THUMB_W: int = 240
 THUMB_H: int = 135
 
-CONFIG_FILE  = os.path.join(os.path.expanduser("~"), ".scenecaster_scenes.json")
+APP_DIR   = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR  = os.path.join(APP_DIR, "data")
+MEDIA_DIR = os.path.join(APP_DIR, "media")
+VIDEOS_DIR = os.path.join(MEDIA_DIR, "videos")
+GIFS_DIR   = os.path.join(MEDIA_DIR, "gifs")
+IMAGES_DIR = os.path.join(MEDIA_DIR, "images")
+ASSETS_DIR = os.path.join(MEDIA_DIR, "assets")
+MUSIC_DIR  = os.path.join(MEDIA_DIR, "music")
+os.makedirs(DATA_DIR, exist_ok=True)
+for _d in (MEDIA_DIR, VIDEOS_DIR, GIFS_DIR, IMAGES_DIR, ASSETS_DIR, MUSIC_DIR):
+    os.makedirs(_d, exist_ok=True)
+
+CONFIG_FILE  = os.path.join(DATA_DIR, "scenecaster_scenes.json")
 TRANSITION_MS = 300   # scene crossfade duration (ms)
 MUSIC_FADE_MS = 500   # music fade duration (ms)
+
+# Non-native dialogs inherit the app's scaled font/stylesheet, so they stay
+# usable on high-DPI touch panels (the OS-native picker ignores our scaling).
+_DIALOG_OPTS = QFileDialog.Option.DontUseNativeDialog
 
 # ─── DPI Auto-Scale ───────────────────────────────────────────────────────────
 def _compute_ui_scale() -> float:
@@ -131,14 +147,34 @@ FONT_BODY:  str = "Segoe UI"
 
 
 def _touch_scroll(widget) -> None:
-    """Enable kinetic (momentum) touch scrolling on a QScrollArea or QAbstractScrollArea.
-    Hides the scrollbars — the user swipes instead."""
+    """Enable kinetic (momentum) touch scrolling on a QScrollArea or QAbstractScrollArea,
+    plus a large always-visible scrollbar as a reliable fallback — swipe-to-scroll gesture
+    recognition isn't consistent on all touch panels, so a big draggable handle is kept
+    on screen rather than hidden."""
     QScroller.grabGesture(
         widget.viewport() if hasattr(widget, "viewport") else widget,
         QScroller.ScrollerGestureType.LeftMouseButtonGesture,
     )
-    widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    bar_w = px(34)
+    widget.setStyleSheet(widget.styleSheet() + f"""
+        QScrollBar:vertical {{
+            width: {bar_w}px; background: {C_VOID}; margin: 0px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {C_ACCENT_PURPLE}; border-radius: {bar_w // 2}px; min-height: {px(60)}px;
+        }}
+        QScrollBar::handle:vertical:pressed {{
+            background: {C_ACCENT_GOLD};
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+            background: transparent;
+        }}
+    """)
 
 
 def media_kind(path: str) -> Optional[str]:
@@ -509,7 +545,11 @@ class OutputWindow(QWidget):
                     if not pix.isNull():
                         self._asset_pix_cache[path] = pix
             self._redraw_composite()
-            self._update_video_placed_assets()
+
+        # Video props are drawn as QGraphicsPixmapItems positioned from pa.x/y/w/h/visible,
+        # so this must run on every update (move/resize/visibility), not just when the
+        # set of asset paths changes, or edits to an already-placed prop never show.
+        self._update_video_placed_assets()
 
         if self.current_kind in ("image", "gif"):
             self._placed_overlay.resize(self.size())
@@ -941,6 +981,34 @@ class MediaTile(QListWidgetItem):
         tag = {"image": "IMG", "gif": "GIF", "video": "VID"}.get(self.kind, "?")
         self.setText(f"[{tag}] {os.path.basename(path)}")
         self.setToolTip(path)
+        self.setIcon(self._build_thumb(tag))
+
+    def _build_thumb(self, tag: str) -> QIcon:
+        ts = px(40)
+        if self.kind in ("image", "gif") and os.path.exists(self.path):
+            reader = QImageReader(self.path)
+            reader.setAutoTransform(True)
+            pix = QPixmap.fromImage(reader.read())
+            if not pix.isNull():
+                return QIcon(pix.scaled(ts, ts, Qt.AspectRatioMode.KeepAspectRatio,
+                                         Qt.TransformationMode.SmoothTransformation))
+        # No cheap static frame for video/audio (or a bad read) — draw a
+        # placeholder swatch so every row still shows something to the side.
+        pix = QPixmap(ts, ts)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(C_CARD))
+        p.setPen(QPen(QColor(C_BORDER_GOLD), 1))
+        p.drawRoundedRect(0, 0, ts - 1, ts - 1, 6, 6)
+        p.setPen(QColor(C_TEXT_RUNE))
+        f = QFont(FONT_BODY)
+        f.setPointSize(pt(8))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, tag)
+        p.end()
+        return QIcon(pix)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1045,7 +1113,7 @@ class AssetConfigDialog(QDialog):
 
     def _browse_sound(self):
         exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXT))
-        path, _ = QFileDialog.getOpenFileName(self, "Sound file", "", f"Audio ({exts})")
+        path, _ = QFileDialog.getOpenFileName(self, "Sound file", MUSIC_DIR, f"Audio ({exts})", options=_DIALOG_OPTS)
         if path:
             self.asset.sound_path = path
             self._snd_edit.setText(os.path.basename(path))
@@ -1061,7 +1129,7 @@ class AssetConfigDialog(QDialog):
 # AssetTile — one entry in the asset library panel (drag source)
 # ─────────────────────────────────────────────────────────────────────────────
 class AssetTile(QWidget):
-    DRAG_THRESHOLD = 10
+    DRAG_THRESHOLD = 28     # touch fingers jitter far more than a mouse cursor while held still
     LONG_PRESS_MS  = 600
 
     def __init__(self, asset: AssetItem, library_panel, parent=None):
@@ -1073,46 +1141,124 @@ class AssetTile(QWidget):
         self._long_press_timer = QTimer(self)
         self._long_press_timer.setSingleShot(True)
         self._long_press_timer.timeout.connect(self._on_long_press)
-        self.setFixedHeight(px(110))
+        self.setFixedHeight(px(190))
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self._build_ui()
         self._set_normal_style()
 
     def _build_ui(self):
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(px(10), px(8), px(10), px(8))
-        lay.setSpacing(px(12))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(px(10), px(8), px(10), px(8))
+        outer.setSpacing(px(8))
+
+        top = QHBoxLayout()
+        top.setSpacing(px(12))
 
         self.thumb_lbl = QLabel()
         self.thumb_lbl.setFixedSize(px(80), px(80))
         self.thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb_lbl.setStyleSheet(f"background:{C_VOID}; border-radius:{px(6)}px;")
         self._load_thumb()
-        lay.addWidget(self.thumb_lbl)
+        top.addWidget(self.thumb_lbl)
 
         info = QVBoxLayout()
         info.setSpacing(px(3))
         name_lbl = QLabel(os.path.basename(self.asset.path))
         name_lbl.setStyleSheet(f"color:{C_TEXT_PARCH}; font-size:{pt(11)}pt; font-weight:600;")
+        name_lbl.setWordWrap(True)
         info.addWidget(name_lbl)
-        w_pct = int(self.asset.size_w * 100)
-        h_pct = int(self.asset.size_h * 100)
-        self.size_lbl = QLabel(f"{w_pct}% × {h_pct}%")
-        self.size_lbl.setStyleSheet(f"color:{C_TEXT_RUNE}; font-size:{pt(9)}pt;")
-        info.addWidget(self.size_lbl)
         if self.asset.sound_path:
             self.snd_lbl = QLabel(f"♪ {os.path.basename(self.asset.sound_path)}")
             self.snd_lbl.setStyleSheet(f"color:{C_GLOW_PURPLE}; font-size:{pt(9)}pt;")
             info.addWidget(self.snd_lbl)
-        hint_lbl = QLabel("Hold to configure • Drag to place")
+        hint_lbl = QLabel("Hold to set sound • Drag to place")
         hint_lbl.setStyleSheet(f"color:{C_BORDER}; font-size:{pt(9)}pt;")
         info.addWidget(hint_lbl)
-        lay.addLayout(info, 1)
+        info.addStretch(1)
+        top.addLayout(info, 1)
+
+        # Big, obviously-tappable clone/delete buttons — sized for a finger, not a cursor.
+        clone_btn = QPushButton("⧉ Clone")
+        clone_btn.setFixedSize(px(96), px(56))
+        clone_btn.setStyleSheet(
+            f"QPushButton {{ background:{C_HOVER}; color:{C_TEXT_PARCH}; "
+            f"border:1px solid {C_ACCENT_PURPLE}; border-radius:{px(8)}px; font-size:{pt(11)}pt; }}"
+            f"QPushButton:pressed {{ background:{C_ACCENT_PURPLE}; }}")
+        clone_btn.clicked.connect(self._on_clone)
+        top.addWidget(clone_btn)
+
+        del_btn = QPushButton("✕ Delete")
+        del_btn.setFixedSize(px(96), px(56))
+        del_btn.setStyleSheet(
+            f"QPushButton {{ background:{C_HOVER}; color:{C_DANGER}; "
+            f"border:1px solid {C_DANGER}; border-radius:{px(8)}px; font-size:{pt(11)}pt; }}"
+            f"QPushButton:pressed {{ background:{C_DANGER}; color:white; }}")
+        del_btn.clicked.connect(self._on_delete)
+        top.addWidget(del_btn)
+
+        outer.addLayout(top)
+
+        # Horizontal size slider spanning the tile width — drag it to scale the asset.
+        # Saves the moment you lift your finger, not on every intermediate value.
+        size_row = QHBoxLayout()
+        size_row.setSpacing(px(10))
+        size_lbl = QLabel("Size:")
+        size_lbl.setStyleSheet(f"color:{C_TEXT_AGED}; font-size:{pt(11)}pt;")
+        size_row.addWidget(size_lbl)
+        self.size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.size_slider.setRange(3, 100)
+        self.size_slider.setValue(int(round(self.asset.size_w * 100)))
+        self.size_slider.setMinimumHeight(px(48))
+        self.size_slider.setPageStep(2)
+        self.size_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                height: {px(10)}px; border-radius: {px(5)}px; background: {C_INPUT};
+            }}
+            QSlider::handle:horizontal {{
+                width: {px(44)}px; height: {px(44)}px; margin: -{px(17)}px 0;
+                border-radius: {px(22)}px; background: {C_ACCENT_GOLD};
+                border: {px(2)}px solid {C_VOID};
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {C_ACCENT_PURPLE}; border-radius: {px(5)}px;
+            }}
+        """)
+        self.size_slider.valueChanged.connect(self._on_size_slider_changed)
+        self.size_slider.sliderReleased.connect(self._on_size_slider_released)
+        size_row.addWidget(self.size_slider, 1)
+        self.size_pct_lbl = QLabel(self._size_label_text())
+        self.size_pct_lbl.setMinimumWidth(px(120))
+        self.size_pct_lbl.setStyleSheet(f"color:{C_TEXT_RUNE}; font-size:{pt(11)}pt;")
+        size_row.addWidget(self.size_pct_lbl)
+        outer.addLayout(size_row)
+
+    def _size_label_text(self) -> str:
+        ref = self._library.reference_screen_size()
+        px_w = round(self.asset.size_w * ref.width())
+        px_h = round(self.asset.size_h * ref.height())
+        pct  = int(round(self.asset.size_w * 100))
+        return f"{pct}% ≈ {px_w}×{px_h}px"
+
+    def _on_size_slider_changed(self, value: int):
+        ratio = value / 100
+        self.asset.size_w = ratio
+        self.asset.size_h = ratio
+        self.size_pct_lbl.setText(self._size_label_text())
+
+    def _on_size_slider_released(self):
+        self._library.on_asset_changed()
+
+    def _on_clone(self):
+        self._library.clone_asset(self.asset)
+
+    def _on_delete(self):
+        self._library.delete_asset(self.asset)
 
     def refresh_labels(self):
-        w_pct = int(self.asset.size_w * 100)
-        h_pct = int(self.asset.size_h * 100)
-        self.size_lbl.setText(f"{w_pct}% × {h_pct}%")
+        self.size_slider.blockSignals(True)
+        self.size_slider.setValue(int(round(self.asset.size_w * 100)))
+        self.size_slider.blockSignals(False)
+        self.size_pct_lbl.setText(self._size_label_text())
 
     def _load_thumb(self):
         path = self.asset.path
@@ -1206,7 +1352,7 @@ class AssetLibraryPanel(QWidget):
             f'font-family:"{FONT_SERIF}"; font-size:{pt(13)}pt; font-weight:700; color:{C_ACCENT_GOLD};')
         lay.addWidget(hdr)
 
-        sub = QLabel("Hold tile to configure • Drag to place")
+        sub = QLabel("Slide to resize • Hold to set sound • Drag to place")
         sub.setStyleSheet(f"color:{C_TEXT_RUNE}; font-size:{pt(9)}pt;")
         lay.addWidget(sub)
 
@@ -1233,14 +1379,37 @@ class AssetLibraryPanel(QWidget):
 
     def _add_assets(self):
         exts = " ".join(f"*{e}" for e in sorted(IMAGE_EXT | GIF_EXT))
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Add assets", "", f"Images & GIFs ({exts})")
+        files = _pick_media_files(
+            self, "Add assets", ASSETS_DIR, f"Images & GIFs ({exts})", multi=True)
         for path in files:
             if not any(a.path == path for a in self.controller.asset_library):
                 self.controller.asset_library.append(AssetItem(path=path))
         if files:
             self.controller._save_scenes()
             self._refresh_tiles()
+
+    def clone_asset(self, asset: "AssetItem"):
+        clone = AssetItem(path=asset.path, size_w=asset.size_w, size_h=asset.size_h,
+                           sound_path=asset.sound_path, effect=asset.effect)
+        lib = self.controller.asset_library
+        idx = next((i for i, a in enumerate(lib) if a is asset), len(lib) - 1)
+        lib.insert(idx + 1, clone)
+        self.controller._save_scenes()
+        self._refresh_tiles()
+
+    def delete_asset(self, asset: "AssetItem"):
+        reply = QMessageBox.question(
+            self, "Delete Asset",
+            f"Remove \"{os.path.basename(asset.path)}\" from the library?\n"
+            "Props already placed on scenes are not affected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        lib = self.controller.asset_library
+        self.controller.asset_library = [a for a in lib if a is not asset]
+        self.controller._save_scenes()
+        self._refresh_tiles()
 
     def _refresh_tiles(self):
         for tile in self._tiles:
@@ -1259,6 +1428,20 @@ class AssetLibraryPanel(QWidget):
     def on_asset_changed(self):
         self.controller._save_scenes()
 
+    def reference_screen_size(self) -> QSize:
+        """Best-guess screen to convert an asset's size ratio into pixels for display.
+        Picks the first non-main output (i.e. an actual cast screen, not the control
+        panel's own monitor); falls back to the primary screen if none are set up yet."""
+        outputs = self.controller.outputs
+        for idx, out in enumerate(outputs):
+            if idx != self.controller._main_screen_idx:
+                size = out.size()
+                if size.width() > 0 and size.height() > 0:
+                    return size
+                return out._screen.geometry().size()
+        screen = QGuiApplication.primaryScreen()
+        return screen.geometry().size() if screen else QSize(1920, 1080)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PlacedAssetItem — interactive widget for a prop placed on the MiniMapCanvas
@@ -1267,7 +1450,7 @@ class PlacedAssetItem(QWidget):
     TAP_WINDOW_MS  = 400    # max gap between two taps for a double-tap
     HOLD_DELETE_MS = 800    # hold duration on 2nd tap to trigger delete
     LOCK_HOLD_MS   = 5000   # two-finger hold duration to toggle lock
-    DRAG_THRESHOLD = 8
+    DRAG_THRESHOLD = 28     # touch fingers jitter far more than a mouse cursor while held still
 
     deleted = pyqtSignal(object)
     moved   = pyqtSignal(object)
@@ -1731,6 +1914,16 @@ class SceneEditorDialog(QDialog):
 
         lbl_style = f"color:{C_TEXT_RUNE}; font-size:{pt(10)}pt;"
 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        _touch_scroll(scroll)
+
+        screens_container = QWidget()
+        screens_lay = QVBoxLayout(screens_container)
+        screens_lay.setContentsMargins(0, 0, 0, 0)
+        screens_lay.setSpacing(px(8))
+
         for i in range(screen_count):
             k = str(i)
             grp = QGroupBox(f"Screen {i + 1}")
@@ -1794,7 +1987,10 @@ class SceneEditorDialog(QDialog):
             fill_row.addWidget(fill_combo, 1)
             glay.addLayout(fill_row)
 
-            lay.addWidget(grp)
+            screens_lay.addWidget(grp)
+
+        scroll.setWidget(screens_container)
+        lay.addWidget(scroll, 1)
 
         # Music row
         mgrp = QGroupBox("Music")
@@ -1824,6 +2020,29 @@ class SceneEditorDialog(QDialog):
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
 
+        self._fit_to_screen(parent)
+
+    def _fit_to_screen(self, parent):
+        """Cap dialog size to the available area of the screen it opens on, and
+        center it there. Prevents the dialog from growing off-screen when many
+        monitors are configured (each adds a Screen N group box)."""
+        screen = None
+        if parent is not None and parent.window() is not None:
+            screen = parent.window().screen()
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        margin_w = max(px(40), int(avail.width() * 0.05))
+        margin_h = max(px(40), int(avail.height() * 0.05))
+        self.setMaximumSize(avail.width() - margin_w, avail.height() - margin_h)
+        self.resize(min(self.sizeHint().width(), self.maximumWidth()),
+                    min(self.sizeHint().height(), self.maximumHeight()))
+        x = avail.x() + (avail.width() - self.width()) // 2
+        y = avail.y() + (avail.height() - self.height()) // 2
+        self.move(x, y)
+
     def _btn(self):
         return ""
 
@@ -1838,17 +2057,17 @@ class SceneEditorDialog(QDialog):
 
     def _browse_bg(self, k: str):
         exts = " ".join(f"*{e}" for e in sorted(ALL_EXT))
-        path, _ = QFileDialog.getOpenFileName(self, "Background media", "", f"Media ({exts})")
-        if path:
-            self._bg[k] = path
-            self._set_field(f"bg_{k}", path)
+        files = _pick_media_files(self, "Background media", MEDIA_DIR, f"Media ({exts})")
+        if files:
+            self._bg[k] = files[0]
+            self._set_field(f"bg_{k}", files[0])
 
     def _browse_ov(self, k: str):
         exts = " ".join(f"*{e}" for e in sorted(IMAGE_EXT | GIF_EXT))
-        path, _ = QFileDialog.getOpenFileName(self, "Overlay image/GIF", "", f"Image/GIF ({exts})")
-        if path:
-            self._overlay[k] = path
-            self._set_field(f"ov_{k}", path)
+        files = _pick_media_files(self, "Overlay image/GIF", MEDIA_DIR, f"Image/GIF ({exts})")
+        if files:
+            self._overlay[k] = files[0]
+            self._set_field(f"ov_{k}", files[0])
 
     def _clear_field(self, role: str, k: str):
         if role == "bg":
@@ -1859,7 +2078,7 @@ class SceneEditorDialog(QDialog):
 
     def _browse_music(self):
         exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXT))
-        path, _ = QFileDialog.getOpenFileName(self, "Music track", "", f"Audio ({exts})")
+        path, _ = QFileDialog.getOpenFileName(self, "Music track", MUSIC_DIR, f"Audio ({exts})", options=_DIALOG_OPTS)
         if path:
             self._music = path
             self._music_edit.setText(os.path.basename(path))
@@ -2202,16 +2421,148 @@ class ScreenCard(QFrame):
         QTimer.singleShot(200, lambda: self.controller._refresh_thumb(self.screen_index))
 
     def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls():
+        mime = e.mimeData()
+        if mime.hasUrls() or mime.hasFormat("application/x-asset-path") or mime.hasText():
             e.acceptProposedAction()
 
     def dropEvent(self, e: QDropEvent):
-        for url in e.mimeData().urls():
-            p = url.toLocalFile()
-            if media_kind(p):
-                self.controller.add_media(p)
-                self.controller.push_to_screen(self.screen_index, p)
-                break
+        mime = e.mimeData()
+        p = ""
+        if mime.hasUrls():
+            for url in mime.urls():
+                candidate = url.toLocalFile()
+                if media_kind(candidate):
+                    p = candidate
+                    break
+        elif mime.hasFormat("application/x-asset-path"):
+            p = bytes(mime.data("application/x-asset-path")).decode("utf-8")
+        elif mime.hasText():
+            p = mime.text()
+
+        if p and media_kind(p):
+            self.controller.add_media(p)
+            self.controller.push_to_screen(self.screen_index, p)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MediaPreviewFileDialog — open/add-file dialog with a live preview pane
+# (image → static, gif → animated, video → muted playback)
+# ─────────────────────────────────────────────────────────────────────────────
+class MediaPreviewFileDialog(QFileDialog):
+    PREVIEW_SIZE = 240
+
+    def __init__(self, parent, title: str, directory: str, name_filter: str):
+        super().__init__(parent, title, directory, name_filter)
+        self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        self._movie: Optional[QMovie] = None
+        self._build_preview()
+        self.currentChanged.connect(self._update_preview)
+
+    def _build_preview(self):
+        ts = px(self.PREVIEW_SIZE)
+
+        self._img_label = QLabel("No preview")
+        self._img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_label.setWordWrap(True)
+
+        self._video_widget = QVideoWidget()
+        self._video_player = QMediaPlayer(self)
+        self._video_audio = QAudioOutput(self)
+        self._video_audio.setMuted(True)
+        self._video_player.setAudioOutput(self._video_audio)
+        self._video_player.setVideoOutput(self._video_widget)
+        self._video_player.setLoops(QMediaPlayer.Loops.Infinite)
+
+        holder = QWidget()
+        holder.setFixedSize(ts, ts)
+        holder.setStyleSheet(
+            f"background:{C_VOID}; color:{C_TEXT_RUNE}; border-radius:{px(6)}px;")
+        self._preview_stack = QStackedLayout(holder)
+        self._preview_stack.addWidget(self._img_label)
+        self._preview_stack.addWidget(self._video_widget)
+
+        layout = self.layout()
+        if isinstance(layout, QGridLayout):
+            layout.addWidget(holder, 0, layout.columnCount(), layout.rowCount(), 1)
+
+    def _update_preview(self, path: str):
+        self._video_player.stop()
+        if self._movie is not None:
+            self._movie.stop()
+            self._movie = None
+
+        kind = media_kind(path) if path else None
+        if kind in ("image", "gif") and os.path.isfile(path):
+            self._preview_stack.setCurrentWidget(self._img_label)
+            ts = px(self.PREVIEW_SIZE)
+            if kind == "gif":
+                self._movie = QMovie(path)
+                self._movie.setScaledSize(QSize(ts, ts))
+                self._img_label.setMovie(self._movie)
+                self._movie.start()
+            else:
+                reader = QImageReader(path)
+                reader.setAutoTransform(True)
+                pix = QPixmap.fromImage(reader.read())
+                self._img_label.setMovie(None)
+                if not pix.isNull():
+                    self._img_label.setPixmap(
+                        pix.scaled(ts, ts, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation))
+                else:
+                    self._img_label.setText("No preview")
+        elif kind == "video" and os.path.isfile(path):
+            self._preview_stack.setCurrentWidget(self._video_widget)
+            self._video_player.setSource(QUrl.fromLocalFile(path))
+            self._video_player.play()
+        else:
+            self._preview_stack.setCurrentWidget(self._img_label)
+            self._img_label.setMovie(None)
+            self._img_label.setPixmap(QPixmap())
+            self._img_label.setText("No preview")
+
+    def done(self, result):
+        self._video_player.stop()
+        if self._movie is not None:
+            self._movie.stop()
+        super().done(result)
+
+
+def _pick_media_files(parent, title: str, directory: str, name_filter: str,
+                       multi: bool = False) -> list[str]:
+    dlg = MediaPreviewFileDialog(parent, title, directory, name_filter)
+    dlg.setFileMode(QFileDialog.FileMode.ExistingFiles if multi
+                     else QFileDialog.FileMode.ExistingFile)
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        return dlg.selectedFiles()
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MediaListWidget — Media Library list that supports dragging items onto a
+# ScreenCard (drop target already understands application/x-asset-path)
+# ─────────────────────────────────────────────────────────────────────────────
+class MediaListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+
+    def startDrag(self, supportedActions):
+        item = self.currentItem()
+        if item is None:
+            return
+        path = item.path
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData("application/x-asset-path", path.encode())
+        mime.setText(path)
+        drag.setMimeData(mime)
+        icon = item.icon()
+        if not icon.isNull():
+            pm = icon.pixmap(px(40), px(40))
+            drag.setPixmap(pm)
+            drag.setHotSpot(QPoint(pm.width() // 2, pm.height() // 2))
+        drag.exec(Qt.DropAction.CopyAction)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2668,7 +3019,8 @@ class ControlWindow(QWidget):
         lib_lbl = self._runic_label("Media Library")
         ll.addWidget(lib_lbl)
 
-        self.media_list = QListWidget()
+        self.media_list = MediaListWidget()
+        self.media_list.setIconSize(QSize(px(40), px(40)))
         self.media_list.setAcceptDrops(True)
         self.media_list.itemDoubleClicked.connect(self._preview_or_hint)
         _touch_scroll(self.media_list)
@@ -2898,12 +3250,14 @@ class ControlWindow(QWidget):
 
     def _add_files_dialog(self):
         exts = " ".join(f"*{e}" for e in sorted(ALL_EXT))
-        files, _ = QFileDialog.getOpenFileNames(self, "Add media", "", f"Media ({exts})")
+        files = _pick_media_files(self, "Add media", MEDIA_DIR, f"Media ({exts})", multi=True)
         for f in files:
             self.add_media(f)
 
     def _add_folder_dialog(self):
-        d = QFileDialog.getExistingDirectory(self, "Add folder")
+        d = QFileDialog.getExistingDirectory(
+            self, "Add folder", MEDIA_DIR,
+            options=QFileDialog.Option.ShowDirsOnly | _DIALOG_OPTS)
         if not d:
             return
         for name in sorted(os.listdir(d)):
@@ -2913,7 +3267,7 @@ class ControlWindow(QWidget):
 
     def _add_music_dialog(self):
         exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXT))
-        path, _ = QFileDialog.getOpenFileName(self, "Add music", "", f"Audio ({exts})")
+        path, _ = QFileDialog.getOpenFileName(self, "Add music", MUSIC_DIR, f"Audio ({exts})", options=_DIALOG_OPTS)
         if path:
             self._play_music(path)
 
